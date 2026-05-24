@@ -16,17 +16,16 @@ from yt_dlp import YoutubeDL
 from telethon.sync import TelegramClient
 from .. import Bot as app
 
-@gagan.on(events.NewMessage(pattern=f"^/start"))
+@gagan.on(events.NewMessage(pattern=r"^/start\s*$"))
 async def start(event):
     """
-    Command to start the bot
+    Command to start the bot (bare /start only — /start {param} is handled by Pyrogram Bot)
     """
     user_id = event.sender_id
     buttons = [
         [Button.url("Join Channel", url="https://t.me/devggn")],
         [Button.url("Contact Me", url="https://t.me/ggnhere")],
     ]
-    # Sending photo with caption and buttons
     await gagan.send_file(
         event.chat_id,
         file=START_PIC,
