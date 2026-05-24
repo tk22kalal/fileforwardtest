@@ -102,10 +102,10 @@ async def _smart_download(ub, client, msg, src_chat, msg_id, edit_msg):
         _last_upd[0] = now
         pct = current * 100 / total if total else 0
         filled = int(pct / 10)
-        bar = "🟢" * filled + "🔴" * (10 - filled)
+        bar = "🤢" * filled + "🔴" * (10 - filled)
         try:
             await edit_msg.edit_text(
-                f"**__Unrestricting [Team SPY](https://t.me/dev_gagan)__** ⚡\n"
+                f"**__UnrestrictingX [Team SPY](https://t.me/dev_gagan)__** ⚡\n"
                 f"{bar}\n"
                 f"**Completed:** {humanbytes(current)} of {humanbytes(total)}\n"
                 f"**Speed:** {humanbytes(speed)}/s  ·  {pct:.0f}%"
