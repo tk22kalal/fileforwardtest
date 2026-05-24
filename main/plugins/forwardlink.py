@@ -7,7 +7,10 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from .. import Bot, userbot, SUDO_USERS, DB_CHANNEL, PROTECT_CONTENT, CUSTOM_CAPTION, DISABLE_CHANNEL_BUTTON
+# Import the main module itself so we always read the LIVE value of userbot,
+# not a frozen snapshot taken at import time (Python's "from X import Y" pitfall).
+import main as _main_module
+from .. import Bot, SUDO_USERS, DB_CHANNEL, SESSION, PROTECT_CONTENT, CUSTOM_CAPTION, DISABLE_CHANNEL_BUTTON
 from main.plugins.link_helpers import encode, decode, get_db_messages, get_db_message_id
 
 logger = logging.getLogger(__name__)
@@ -17,12 +20,31 @@ ADMINS = list(SUDO_USERS)
 _bot_username_cache = None
 
 
+def _userbot():
+    """Always return the current live userbot from the main module."""
+    return _main_module.userbot
+
+
 async def _get_bot_username(client: Client) -> str:
     global _bot_username_cache
     if not _bot_username_cache:
         me = await client.get_me()
         _bot_username_cache = me.username
     return _bot_username_cache
+
+
+def _userbot_error() -> str:
+    """Return a specific error message depending on what is wrong."""
+    if not SESSION:
+        return (
+            "❌ <b>SESSION not set.</b>\n\n"
+            "Add your Pyrogram string session as the <code>SESSION</code> env var and redeploy."
+        )
+    return (
+        "❌ <b>Userbot failed to start.</b>\n\n"
+        "SESSION is set but the session is invalid or expired.\n"
+        "Generate a fresh Pyrogram session string and update the <code>SESSION</code> env var."
+    )
 
 
 def _parse_tme_link(link: str):
@@ -51,10 +73,14 @@ def _make_link_markup(link: str) -> InlineKeyboardMarkup:
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command("fwd"))
 async def fwd_command(client: Client, message: Message):
-    if not userbot:
-        return await message.reply("❌ No userbot SESSION configured.\nSet the SESSION env var and restart.")
+    ub = _userbot()
+    if not ub:
+        return await message.reply(_userbot_error())
     if not DB_CHANNEL:
-        return await message.reply("❌ DB_CHANNEL not configured.\nSet the DB_CHANNEL env var and restart.")
+        return await message.reply(
+            "❌ <b>DB_CHANNEL not set.</b>\n\n"
+            "Add your database channel ID as the <code>DB_CHANNEL</code> env var and redeploy."
+        )
 
     try:
         asked = await client.ask(
@@ -78,7 +104,7 @@ async def fwd_command(client: Client, message: Message):
 
     status = await asked.reply("⏳ Copying to DB channel…")
     try:
-        sent = await userbot.copy_message(
+        sent = await ub.copy_message(
             chat_id=DB_CHANNEL,
             from_chat_id=src_chat,
             message_id=msg_id,
@@ -99,10 +125,14 @@ async def fwd_command(client: Client, message: Message):
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command("batchfwd"))
 async def batchfwd_command(client: Client, message: Message):
-    if not userbot:
-        return await message.reply("❌ No userbot SESSION configured.\nSet the SESSION env var and restart.")
+    ub = _userbot()
+    if not ub:
+        return await message.reply(_userbot_error())
     if not DB_CHANNEL:
-        return await message.reply("❌ DB_CHANNEL not configured.\nSet the DB_CHANNEL env var and restart.")
+        return await message.reply(
+            "❌ <b>DB_CHANNEL not set.</b>\n\n"
+            "Add your database channel ID as the <code>DB_CHANNEL</code> env var and redeploy."
+        )
 
     while True:
         try:
@@ -151,7 +181,7 @@ async def batchfwd_command(client: Client, message: Message):
 
     for msg_id in ids:
         try:
-            sent = await userbot.copy_message(
+            sent = await ub.copy_message(
                 chat_id=DB_CHANNEL,
                 from_chat_id=src_chat,
                 message_id=msg_id,
@@ -163,7 +193,7 @@ async def batchfwd_command(client: Client, message: Message):
         except FloodWait as e:
             await asyncio.sleep(e.value + 2)
             try:
-                sent = await userbot.copy_message(
+                sent = await ub.copy_message(
                     chat_id=DB_CHANNEL,
                     from_chat_id=src_chat,
                     message_id=msg_id,
