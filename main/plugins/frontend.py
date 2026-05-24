@@ -57,6 +57,11 @@ async def clone(event):
     logging.info(event)
     file_name = ''
 
+    # Skip users currently inside a /fwd interactive flow
+    import main as _main_module
+    if event.sender_id in _main_module.fwd_active_users:
+        return
+
     # Skip all bot commands
     if event.message.text and any(
         event.message.text.strip().startswith(cmd) for cmd in commands
