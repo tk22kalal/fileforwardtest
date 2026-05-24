@@ -9,7 +9,8 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 from .. import Bot, bot
 from main.plugins.progress import progress_for_pyrogram
-from main.plugins.helpers import screenshot
+from main.plugins.helpers import screenshot, humanbytes
+from main.plugins.fast_download import parallel_download, ext_from_mime
 
 from pyrogram import Client, filters
 from pyrogram.errors import ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid, FloodWait
@@ -61,6 +62,81 @@ async def _get_thumb(acc, msg, sender, file, duration):
         pass
 
     return None
+
+
+async def _smart_download(ub, client, msg, src_chat, msg_id, edit_msg):
+    """
+    Try parallel chunked download first (IDM-style, up to 4 streams).
+    Falls back to standard sequential download_media() on any failure.
+    Returns the local file path as a string.
+    """
+    # Determine output filename from media metadata
+    if msg.document and msg.document.file_name:
+        fname = msg.document.file_name
+    elif msg.document:
+        fname = f"{msg_id}{ext_from_mime(msg.document.mime_type or '')}"
+    elif msg.video:
+        fname = f"{msg_id}.mp4"
+    elif msg.audio:
+        fname = getattr(msg.audio, "file_name", None) or f"{msg_id}.mp3"
+    elif msg.voice:
+        fname = f"{msg_id}.ogg"
+    elif msg.photo:
+        fname = f"{msg_id}.jpg"
+    elif msg.video_note:
+        fname = f"{msg_id}.mp4"
+    elif msg.animation:
+        fname = f"{msg_id}.gif"
+    else:
+        fname = f"{msg_id}.bin"
+
+    out_path = os.path.join(DOWNLOADS_DIR, fname)
+
+    # Progress callback — throttled to once every 5 s to avoid FloodWait
+    _last_upd = [0.0]
+
+    async def _prog(current, total, speed):
+        now = time.time()
+        if now - _last_upd[0] < 5:
+            return
+        _last_upd[0] = now
+        pct = current * 100 / total if total else 0
+        filled = int(pct / 10)
+        bar = "🟢" * filled + "🔴" * (10 - filled)
+        try:
+            await edit_msg.edit_text(
+                f"**__Unrestricting [Team SPY](https://t.me/dev_gagan)__** ⚡\n"
+                f"{bar}\n"
+                f"**Completed:** {humanbytes(current)} of {humanbytes(total)}\n"
+                f"**Speed:** {humanbytes(speed)}/s  ·  {pct:.0f}%"
+            )
+        except Exception:
+            pass
+
+    # ── Attempt 1: parallel chunked download ──────────────────────────────────
+    try:
+        result = await parallel_download(ub, src_chat, msg_id, out_path, _prog)
+        logger.info(f"Parallel download complete: {out_path}")
+        return result
+    except Exception as exc:
+        logger.warning(f"Parallel download failed ({exc}), switching to sequential.")
+
+    # ── Attempt 2: standard sequential download_media (always works) ──────────
+    try:
+        await edit_msg.edit_text("⬇️ Downloading (sequential)…")
+    except Exception:
+        pass
+
+    return await ub.download_media(
+        msg,
+        progress=progress_for_pyrogram,
+        progress_args=(
+            client,
+            "**__Unrestricting__: __[Team SPY](https://t.me/dev_gagan)__**\n ",
+            edit_msg,
+            time.time(),
+        ),
+    )
 
 
 async def copy_message_with_chat_id(client, sender, chat_id, message_id):
@@ -217,18 +293,9 @@ async def get_msg(userbot, client, sender, edit_id, msg_link, i, file_n):
                 return None
 
             if msg.media:
-                edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
+                edit = await client.edit_message_text(sender, edit_id, "⚡ Starting parallel download…")
                 try:
-                    file = await userbot.download_media(
-                        msg,
-                        progress=progress_for_pyrogram,
-                        progress_args=(
-                            client,
-                            "**__Unrestricting__: __[Team SPY](https://t.me/dev_gagan)__**\n ",
-                            edit,
-                            time.time()
-                        )
-                    )
+                    file = await _smart_download(userbot, client, msg, chat, msg_id, edit)
 
                     if not file or not os.path.exists(str(file)) or os.path.getsize(str(file)) == 0:
                         await client.edit_message_text(sender, edit_id, "⚠️ Download failed or file is empty, skipping.")
@@ -361,16 +428,7 @@ async def ggn_new(userbot, client, sender, edit_id, msg_link, i, file_n):
             if msg.media:
                 edit = await client.edit_message_text(sender, edit_id, "Trying to Download.")
                 try:
-                    file = await userbot.download_media(
-                        msg,
-                        progress=progress_for_pyrogram,
-                        progress_args=(
-                            client,
-                            "**__Unrestricting__: __[Team SPY](https://t.me/dev_gagan)__**\n ",
-                            edit,
-                            time.time()
-                        )
-                    )
+                    file = await _smart_download(userbot, client, msg, chat, msg_id, edit)
 
                     if not file or not os.path.exists(str(file)) or os.path.getsize(str(file)) == 0:
                         await client.edit_message_text(sender, edit_id, "⚠️ Download failed or file is empty, skipping.")
