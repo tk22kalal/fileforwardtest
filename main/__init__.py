@@ -31,6 +31,10 @@ SUDO_USERS = set()
 if AUTH.strip():
     SUDO_USERS = {int(x.strip()) for x in AUTH.split()}
 
+# Users currently inside a /fwd interactive flow.
+# frontend.py's clone handler checks this and skips them.
+fwd_active_users: set = set()
+
 # ── Telethon bot (always required) ────────────────────────────────────────────
 bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
