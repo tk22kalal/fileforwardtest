@@ -1,5 +1,7 @@
 import asyncio
+import os
 import re
+import time
 import logging
 from io import BytesIO
 
@@ -18,9 +20,11 @@ ADMINS = list(SUDO_USERS)
 
 _bot_username_cache = None
 
+# Files smaller than this are kept in RAM; larger ones go to a temp file.
+_MEM_LIMIT = 80 * 1024 * 1024   # 80 MB
+
 
 def _userbot():
-    """Always return the current live userbot from the main module."""
     return _main_module.userbot
 
 
@@ -62,16 +66,40 @@ def _make_link_markup(link: str) -> InlineKeyboardMarkup:
     ]])
 
 
-async def _copy_msg_to_db(ub: Client, db_channel: int, src_chat, msg_id: int):
-    """
-    Copy a single message to the DB channel.
+def _fmt_size(b: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
 
-    Strategy:
-      1. Try server-side copy_message (fast, zero bandwidth — works when
-         the channel does NOT have forward-restrictions).
-      2. Fall back to in-memory download → re-upload (no temp files on disk).
-         This is the only way to handle channels with noforwards=True.
+
+async def _copy_msg_to_db(ub: Client, db_channel: int, src_chat, msg_id: int,
+                          status_msg=None):
     """
+    Copy one message to the DB channel.
+
+    Attempt order:
+      1. copy_message  — server-side, zero bandwidth (fails for noforwards channels)
+      2. forward_messages(drop_author=True)  — server-side (also blocked for some channels)
+      3. Download to temp file / RAM → re-upload with live progress shown in status_msg
+    """
+
+    # ── throttled status editor ────────────────────────────────────────────────
+    _last_edit: list[float] = [0.0]
+
+    async def _upd(text: str, force: bool = False):
+        if status_msg is None:
+            return
+        now = time.time()
+        if not force and now - _last_edit[0] < 3:
+            return
+        _last_edit[0] = now
+        try:
+            await status_msg.edit(text)
+        except Exception:
+            pass
+
     # ── Attempt 1: server-side copy ───────────────────────────────────────────
     try:
         return await ub.copy_message(
@@ -80,49 +108,130 @@ async def _copy_msg_to_db(ub: Client, db_channel: int, src_chat, msg_id: int):
             message_id=msg_id,
         )
     except Exception as e:
-        if "CHAT_FORWARDS_RESTRICTED" not in str(e):
-            raise  # unexpected error — let the caller handle it
-        logger.info(f"Server-side copy blocked (noforwards). Falling back to in-memory. msg={msg_id}")
+        err = str(e)
+        if "CHAT_FORWARDS_RESTRICTED" not in err:
+            raise
+        logger.info("copy_message blocked (noforwards). Trying forward_messages…")
 
-    # ── Attempt 2: in-memory download → re-upload ─────────────────────────────
-    msgs = await ub.get_messages(src_chat, msg_id)
-    if not msgs:
+    # ── Attempt 2: server-side forward with hidden author ────────────────────
+    try:
+        result = await ub.forward_messages(
+            chat_id=db_channel,
+            from_chat_id=src_chat,
+            message_ids=msg_id,
+            drop_author=True,
+        )
+        return result[0] if isinstance(result, list) else result
+    except Exception as e:
+        err = str(e)
+        if "CHAT_FORWARDS_RESTRICTED" not in err and "CHAT_ADMIN_REQUIRED" not in err:
+            raise
+        logger.info("forward_messages also blocked. Falling back to download+upload…")
+
+    # ── Attempt 3: download → re-upload (restricted channels) ─────────────────
+    msg = await ub.get_messages(src_chat, msg_id)
+    if not msg:
         raise RuntimeError("Message not found in source channel")
 
-    caption = (msgs.caption or msgs.text or "")
-    if hasattr(caption, "html"):
-        caption = caption.html
+    caption = ""
+    if msg.caption:
+        caption = msg.caption.html
+    elif msg.text:
+        caption = msg.text
 
-    if not msgs.media:
+    if not msg.media:
         return await ub.send_message(db_channel, caption or "(empty message)")
 
-    bio = await ub.download_media(msgs, in_memory=True)
-    bio.seek(0)
+    # Detect media + file size
+    media = (msg.document or msg.video or msg.audio
+             or msg.voice or msg.video_note or msg.photo)
+    file_size: int = getattr(media, "file_size", 0) or 0
+    size_label = _fmt_size(file_size) if file_size else "unknown size"
 
-    if msgs.video:
-        bio.name = getattr(msgs.video, "file_name", None) or "video.mp4"
-        return await ub.send_video(
-            db_channel, bio,
-            caption=caption,
-            duration=msgs.video.duration,
-            width=msgs.video.width,
-            height=msgs.video.height,
+    # ── progress callbacks ────────────────────────────────────────────────────
+    _t0 = [time.time()]
+
+    async def dl_progress(current: int, total: int):
+        elapsed = time.time() - _t0[0]
+        speed = current / elapsed if elapsed > 0 else 0
+        pct = current * 100 / total if total else 0
+        await _upd(
+            f"⬇️ <b>Downloading</b> ({size_label})\n"
+            f"{pct:.0f}%  •  {_fmt_size(current)} / {_fmt_size(total)}\n"
+            f"Speed: {_fmt_size(speed)}/s"
         )
-    elif msgs.document:
-        bio.name = getattr(msgs.document, "file_name", None) or "document"
-        return await ub.send_document(db_channel, bio, caption=caption, file_name=bio.name)
-    elif msgs.audio:
-        bio.name = getattr(msgs.audio, "file_name", None) or "audio.mp3"
-        return await ub.send_audio(db_channel, bio, caption=caption)
-    elif msgs.photo:
-        bio.name = "photo.jpg"
-        return await ub.send_photo(db_channel, bio, caption=caption)
+
+    async def ul_progress(current: int, total: int):
+        elapsed = time.time() - _t0[0]
+        speed = current / elapsed if elapsed > 0 else 0
+        pct = current * 100 / total if total else 0
+        await _upd(
+            f"⬆️ <b>Uploading</b> ({size_label})\n"
+            f"{pct:.0f}%  •  {_fmt_size(current)} / {_fmt_size(total)}\n"
+            f"Speed: {_fmt_size(speed)}/s"
+        )
+
+    # Choose storage: temp file for large, BytesIO for small
+    use_temp = file_size > _MEM_LIMIT
+
+    if use_temp:
+        tmp_path = f"/tmp/fwd_{msg_id}_{int(time.time())}"
+        await _upd(f"⬇️ Downloading ({size_label}) — 0%")
+        _t0[0] = time.time()
+        try:
+            dl_path = await ub.download_media(
+                msg, file_name=tmp_path, progress=dl_progress
+            )
+            await _upd(f"⬆️ Uploading ({size_label}) — 0%", force=True)
+            _t0[0] = time.time()
+            sent = await _send_media(ub, db_channel, msg, dl_path, caption,
+                                     ul_progress)
+        finally:
+            try:
+                os.remove(dl_path)
+            except Exception:
+                pass
+        return sent
     else:
-        bio.name = "file"
-        return await ub.send_document(db_channel, bio, caption=caption)
+        await _upd(f"⬇️ Downloading ({size_label}) — 0%")
+        _t0[0] = time.time()
+        bio = await ub.download_media(msg, in_memory=True, progress=dl_progress)
+        bio.seek(0)
+        await _upd(f"⬆️ Uploading ({size_label}) — 0%", force=True)
+        _t0[0] = time.time()
+        return await _send_media(ub, db_channel, msg, bio, caption, ul_progress)
 
 
-# ── /fwd — forward single restricted message → DB channel → share link ────────
+async def _send_media(ub: Client, db_channel: int, msg: Message,
+                      file, caption: str, progress_cb=None):
+    """Send the right media type to db_channel."""
+    kw = dict(caption=caption, progress=progress_cb)
+    if msg.video:
+        return await ub.send_video(
+            db_channel, file,
+            duration=msg.video.duration,
+            width=msg.video.width,
+            height=msg.video.height,
+            **kw,
+        )
+    elif msg.document:
+        fname = getattr(msg.document, "file_name", None) or "document"
+        return await ub.send_document(db_channel, file, file_name=fname, **kw)
+    elif msg.audio:
+        return await ub.send_audio(db_channel, file, **kw)
+    elif msg.photo:
+        return await ub.send_photo(db_channel, file, caption=caption,
+                                   progress=progress_cb)
+    elif msg.voice:
+        return await ub.send_voice(db_channel, file, **kw)
+    elif msg.video_note:
+        return await ub.send_video_note(db_channel, file,
+                                        progress=progress_cb)
+    else:
+        return await ub.send_document(db_channel, file, **kw)
+
+
+# ── /fwd ──────────────────────────────────────────────────────────────────────
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command("fwd"))
 async def fwd_command(client: Client, message: Message):
@@ -132,7 +241,7 @@ async def fwd_command(client: Client, message: Message):
     if not DB_CHANNEL:
         return await message.reply(
             "❌ <b>DB_CHANNEL not set.</b>\n\n"
-            "Add your database channel ID as the <code>DB_CHANNEL</code> env var and redeploy."
+            "Set the <code>DB_CHANNEL</code> env var and redeploy."
         )
 
     uid = message.from_user.id
@@ -160,22 +269,23 @@ async def fwd_command(client: Client, message: Message):
 
         status = await asked.reply("⏳ Copying to DB channel…")
         try:
-            sent = await _copy_msg_to_db(ub, DB_CHANNEL, src_chat, msg_id)
+            sent = await _copy_msg_to_db(ub, DB_CHANNEL, src_chat, msg_id,
+                                         status_msg=status)
         except Exception as e:
-            return await status.edit(f"❌ Failed to copy message:\n<code>{e}</code>")
+            return await status.edit(f"❌ Failed:\n<code>{e}</code>")
 
         username = await _get_bot_username(client)
         base64_string = await encode(f"get-{sent.id * abs(DB_CHANNEL)}")
         link = f"https://t.me/{username}?start={base64_string}"
         await status.edit(
-            f"✅ <b>Done! Here is your share link:</b>\n\n{link}",
+            f"✅ <b>Done! Share link:</b>\n\n{link}",
             reply_markup=_make_link_markup(link),
         )
     finally:
         _main_module.fwd_active_users.discard(uid)
 
 
-# ── /batchfwd — forward a range of restricted messages → DB channel → share link
+# ── /batchfwd ─────────────────────────────────────────────────────────────────
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command("batchfwd"))
 async def batchfwd_command(client: Client, message: Message):
@@ -185,7 +295,7 @@ async def batchfwd_command(client: Client, message: Message):
     if not DB_CHANNEL:
         return await message.reply(
             "❌ <b>DB_CHANNEL not set.</b>\n\n"
-            "Add your database channel ID as the <code>DB_CHANNEL</code> env var and redeploy."
+            "Set the <code>DB_CHANNEL</code> env var and redeploy."
         )
 
     uid = message.from_user.id
@@ -195,7 +305,7 @@ async def batchfwd_command(client: Client, message: Message):
             try:
                 first_msg = await client.ask(
                     chat_id=uid,
-                    text="📎 Send the link of the <b>FIRST</b> message from the restricted channel:",
+                    text="📎 Send the link of the <b>FIRST</b> message:",
                     filters=filters.text & filters.private,
                     timeout=60,
                 )
@@ -204,13 +314,13 @@ async def batchfwd_command(client: Client, message: Message):
             src_chat, f_id = _parse_tme_link(first_msg.text.strip())
             if src_chat and f_id:
                 break
-            await first_msg.reply("❌ Invalid link. Please try again.")
+            await first_msg.reply("❌ Invalid link. Try again.")
 
         while True:
             try:
                 last_msg = await client.ask(
                     chat_id=uid,
-                    text="📎 Send the link of the <b>LAST</b> message from the restricted channel:",
+                    text="📎 Send the link of the <b>LAST</b> message:",
                     filters=filters.text & filters.private,
                     timeout=60,
                 )
@@ -219,26 +329,28 @@ async def batchfwd_command(client: Client, message: Message):
             last_chat, l_id = _parse_tme_link(last_msg.text.strip())
             if last_chat and l_id:
                 break
-            await last_msg.reply("❌ Invalid link. Please try again.")
+            await last_msg.reply("❌ Invalid link. Try again.")
 
         if str(src_chat) != str(last_chat):
             return await last_msg.reply("❌ Both links must be from the same channel.")
-
         if f_id > l_id:
             f_id, l_id = l_id, f_id
 
         ids = list(range(f_id, l_id + 1))
         total = len(ids)
-        status = await last_msg.reply(f"⏳ Copying {total} message(s) to DB channel…")
+        status = await last_msg.reply(f"⏳ Starting — {total} message(s) to copy…")
 
-        db_start_id = None
-        db_end_id = None
-        done = 0
-        failed = 0
+        db_start_id = db_end_id = None
+        done = failed = 0
 
-        for msg_id in ids:
+        for idx, msg_id in enumerate(ids, 1):
             try:
-                sent = await _copy_msg_to_db(ub, DB_CHANNEL, src_chat, msg_id)
+                await status.edit(f"⏳ [{idx}/{total}] Copying…")
+            except Exception:
+                pass
+            try:
+                sent = await _copy_msg_to_db(ub, DB_CHANNEL, src_chat, msg_id,
+                                             status_msg=status)
                 if db_start_id is None:
                     db_start_id = sent.id
                 db_end_id = sent.id
@@ -257,16 +369,10 @@ async def batchfwd_command(client: Client, message: Message):
             except Exception as e:
                 logger.warning(f"Skipped msg {msg_id}: {e}")
                 failed += 1
-
-            if done % 10 == 0 and done > 0:
-                try:
-                    await status.edit(f"⏳ Copied {done}/{total}…")
-                except Exception:
-                    pass
             await asyncio.sleep(0.5)
 
         if db_start_id is None:
-            return await status.edit("❌ No messages were copied to DB channel.")
+            return await status.edit("❌ No messages were copied.")
 
         username = await _get_bot_username(client)
         base64_string = await encode(
@@ -274,7 +380,7 @@ async def batchfwd_command(client: Client, message: Message):
         )
         link = f"https://t.me/{username}?start={base64_string}"
         await status.edit(
-            f"✅ <b>Done!</b> Copied {done}/{total} messages (skipped {failed}).\n\n"
+            f"✅ Done! {done}/{total} copied (skipped {failed}).\n\n"
             f"<b>Share link:</b>\n{link}",
             reply_markup=_make_link_markup(link),
         )
@@ -282,7 +388,7 @@ async def batchfwd_command(client: Client, message: Message):
         _main_module.fwd_active_users.discard(uid)
 
 
-# ── /genlink — generate share link for a message already in DB channel ────────
+# ── /genlink ──────────────────────────────────────────────────────────────────
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command("genlink"))
 async def genlink_command(client: Client, message: Message):
@@ -309,8 +415,7 @@ async def genlink_command(client: Client, message: Message):
             if msg_id:
                 break
             await channel_message.reply(
-                "❌ That message is not from my DB Channel.\n"
-                "Forward from the correct DB channel or send its post link."
+                "❌ Not from my DB Channel. Try again."
             )
 
         username = await _get_bot_username(client)
@@ -325,7 +430,7 @@ async def genlink_command(client: Client, message: Message):
         _main_module.fwd_active_users.discard(uid)
 
 
-# ── /mkbatch — generate batch link for a range already in DB channel ──────────
+# ── /mkbatch ──────────────────────────────────────────────────────────────────
 
 @Bot.on_message(filters.private & filters.user(ADMINS) & filters.command("mkbatch"))
 async def mkbatch_command(client: Client, message: Message):
@@ -351,7 +456,7 @@ async def mkbatch_command(client: Client, message: Message):
             f_msg_id = await get_db_message_id(client, first_message, DB_CHANNEL)
             if f_msg_id:
                 break
-            await first_message.reply("❌ That message is not from my DB Channel.")
+            await first_message.reply("❌ Not from my DB Channel.")
 
         while True:
             try:
@@ -369,7 +474,7 @@ async def mkbatch_command(client: Client, message: Message):
             s_msg_id = await get_db_message_id(client, second_message, DB_CHANNEL)
             if s_msg_id:
                 break
-            await second_message.reply("❌ That message is not from my DB Channel.")
+            await second_message.reply("❌ Not from my DB Channel.")
 
         username = await _get_bot_username(client)
         base64_string = await encode(
@@ -385,7 +490,7 @@ async def mkbatch_command(client: Client, message: Message):
         _main_module.fwd_active_users.discard(uid)
 
 
-# ── /start {base64} — serve files from DB channel to users ────────────────────
+# ── /start {base64} ───────────────────────────────────────────────────────────
 
 @Bot.on_message(filters.private & filters.regex(r'^/start \S+'))
 async def start_with_link(client: Client, message: Message):
@@ -411,13 +516,7 @@ async def start_with_link(client: Client, message: Message):
             end = int(int(argument[2]) / abs(DB_CHANNEL))
         except Exception:
             return
-        if start <= end:
-            ids = list(range(start, end + 1))
-        else:
-            i = start
-            while i >= end:
-                ids.append(i)
-                i -= 1
+        ids = list(range(start, end + 1)) if start <= end else list(range(start, end - 1, -1))
     elif len(argument) == 2 and argument[0] == "get":
         try:
             ids = [int(int(argument[1]) / abs(DB_CHANNEL))]
