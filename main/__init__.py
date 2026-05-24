@@ -21,6 +21,12 @@ SESSION   = os.environ.get("SESSION",       "").strip()
 FORCESUB  = os.environ.get("FORCESUB",      "forcesubpavo3")
 AUTH      = os.environ.get("AUTH",          "7390527029")
 
+# ── File-store / DB channel config ───────────────────────────────────────────
+DB_CHANNEL       = int(os.environ.get("DB_CHANNEL", "0"))
+PROTECT_CONTENT  = os.environ.get("PROTECT_CONTENT", "False") == "True"
+CUSTOM_CAPTION   = os.environ.get("CUSTOM_CAPTION", None)
+DISABLE_CHANNEL_BUTTON = os.environ.get("DISABLE_CHANNEL_BUTTON", "False") == "True"
+
 SUDO_USERS = set()
 if AUTH.strip():
     SUDO_USERS = {int(x.strip()) for x in AUTH.split()}
